@@ -24,7 +24,15 @@ export const PROXY_BIND_HOST =
   process.env.CREDENTIAL_PROXY_HOST || detectProxyBindHost();
 
 function detectProxyBindHost(): string {
-  if (os.platform() === 'darwin') return '127.0.0.1';
+  if (os.platform() === 'darwin') {
+    if (CONTAINER_RUNTIME_BIN === 'container') {
+      // Apple Container uses real VM networking (VirtioFS/vmnet) — containers
+      // cannot reach 127.0.0.1 on the host. Bind to the bridge100 IP instead.
+      return appleContainerBridgeIp();
+    }
+    // Docker Desktop routes host.docker.internal to loopback.
+    return '127.0.0.1';
+  }
 
   // WSL uses Docker Desktop (same VM routing as macOS) — loopback is correct.
   // Check /proc filesystem, not env vars — WSL_DISTRO_NAME isn't set under systemd.
@@ -40,8 +48,24 @@ function detectProxyBindHost(): string {
   return '0.0.0.0';
 }
 
+/** Returns the host IP that Apple Container VMs use to reach the host (bridge100). */
+function appleContainerBridgeIp(): string {
+  const ifaces = os.networkInterfaces();
+  const bridge = ifaces['bridge100'];
+  if (bridge) {
+    const ipv4 = bridge.find((a) => a.family === 'IPv4');
+    if (ipv4) return ipv4.address;
+  }
+  return '192.168.64.1'; // vmnet default
+}
+
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
+  // Apple Container doesn't support --add-host; the proxy IP is passed directly
+  // in ANTHROPIC_BASE_URL via PROXY_BIND_HOST, so no host entry is needed.
+  if (os.platform() === 'darwin' && CONTAINER_RUNTIME_BIN === 'container') {
+    return [];
+  }
   // On Linux, host.docker.internal isn't built-in — add it explicitly
   if (os.platform() === 'linux') {
     return ['--add-host=host.docker.internal:host-gateway'];
