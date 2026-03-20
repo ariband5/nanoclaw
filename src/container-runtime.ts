@@ -15,7 +15,9 @@ export const CONTAINER_RUNTIME_BIN = 'container';
 export const CONTAINER_HOST_GATEWAY = 'host.docker.internal';
 
 /**
- * Address the credential proxy binds to.
+ * Address the credential proxy binds to on the host.
+ * Apple Container (macOS): 0.0.0.0 — bridge100 only exists while a container is
+ *   running, so we can't bind to it at startup. Bind to all interfaces instead.
  * Docker Desktop (macOS): 127.0.0.1 — the VM routes host.docker.internal to loopback.
  * Docker (Linux): bind to the docker0 bridge IP so only containers can reach it,
  *   falling back to 0.0.0.0 if the interface isn't found.
@@ -23,12 +25,19 @@ export const CONTAINER_HOST_GATEWAY = 'host.docker.internal';
 export const PROXY_BIND_HOST =
   process.env.CREDENTIAL_PROXY_HOST || detectProxyBindHost();
 
+/**
+ * Address advertised to containers in ANTHROPIC_BASE_URL.
+ * May differ from PROXY_BIND_HOST (e.g. Apple Container binds to 0.0.0.0 but
+ * containers must connect via the bridge100 IP, not 0.0.0.0).
+ */
+export const PROXY_ADVERTISE_HOST =
+  process.env.CREDENTIAL_PROXY_HOST || detectProxyAdvertiseHost();
+
 function detectProxyBindHost(): string {
   if (os.platform() === 'darwin') {
     if (CONTAINER_RUNTIME_BIN === 'container') {
-      // Apple Container uses real VM networking (VirtioFS/vmnet) — containers
-      // cannot reach 127.0.0.1 on the host. Bind to the bridge100 IP instead.
-      return appleContainerBridgeIp();
+      // bridge100 only exists while containers are running — bind to all interfaces.
+      return '0.0.0.0';
     }
     // Docker Desktop routes host.docker.internal to loopback.
     return '127.0.0.1';
@@ -46,6 +55,15 @@ function detectProxyBindHost(): string {
     if (ipv4) return ipv4.address;
   }
   return '0.0.0.0';
+}
+
+function detectProxyAdvertiseHost(): string {
+  if (os.platform() === 'darwin' && CONTAINER_RUNTIME_BIN === 'container') {
+    // Apple Container VMs reach the host via bridge100. Resolve dynamically so
+    // we get the real IP if the interface is up, otherwise use the vmnet default.
+    return appleContainerBridgeIp();
+  }
+  return detectProxyBindHost();
 }
 
 /** Returns the host IP that Apple Container VMs use to reach the host (bridge100). */
@@ -74,8 +92,14 @@ export function hostGatewayArgs(): string[] {
 }
 
 /** Returns CLI args for a readonly bind mount. */
-export function readonlyMountArgs(hostPath: string, containerPath: string): string[] {
-  return ['--mount', `type=bind,source=${hostPath},target=${containerPath},readonly`];
+export function readonlyMountArgs(
+  hostPath: string,
+  containerPath: string,
+): string[] {
+  return [
+    '--mount',
+    `type=bind,source=${hostPath},target=${containerPath},readonly`,
+  ];
 }
 
 /** Returns the shell command to stop a container by name. */
@@ -91,7 +115,10 @@ export function ensureContainerRuntimeRunning(): void {
   } catch {
     logger.info('Starting container runtime...');
     try {
-      execSync(`${CONTAINER_RUNTIME_BIN} system start`, { stdio: 'pipe', timeout: 30000 });
+      execSync(`${CONTAINER_RUNTIME_BIN} system start`, {
+        stdio: 'pipe',
+        timeout: 30000,
+      });
       logger.info('Container runtime started');
     } catch (err) {
       logger.error({ err }, 'Failed to start container runtime');
@@ -131,17 +158,26 @@ export function cleanupOrphans(): void {
       stdio: ['pipe', 'pipe', 'pipe'],
       encoding: 'utf-8',
     });
-    const containers: { status: string; configuration: { id: string } }[] = JSON.parse(output || '[]');
+    const containers: { status: string; configuration: { id: string } }[] =
+      JSON.parse(output || '[]');
     const orphans = containers
-      .filter((c) => c.status === 'running' && c.configuration.id.startsWith('nanoclaw-'))
+      .filter(
+        (c) =>
+          c.status === 'running' && c.configuration.id.startsWith('nanoclaw-'),
+      )
       .map((c) => c.configuration.id);
     for (const name of orphans) {
       try {
         execSync(stopContainer(name), { stdio: 'pipe' });
-      } catch { /* already stopped */ }
+      } catch {
+        /* already stopped */
+      }
     }
     if (orphans.length > 0) {
-      logger.info({ count: orphans.length, names: orphans }, 'Stopped orphaned containers');
+      logger.info(
+        { count: orphans.length, names: orphans },
+        'Stopped orphaned containers',
+      );
     }
   } catch (err) {
     logger.warn({ err }, 'Failed to clean up orphaned containers');
